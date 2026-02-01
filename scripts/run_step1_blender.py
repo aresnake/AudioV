@@ -13,7 +13,6 @@ if str(SRC) not in sys.path:
 
 import argparse
 from pathlib import Path as _Path
-from typing import Iterable
 
 import bpy
 
@@ -52,8 +51,7 @@ def _get_or_create_material(name: str) -> bpy.types.Material:
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
-        # In Blender 5+, prefer node_tree existence checks; keep it simple.
-        mat.use_nodes = True
+        mat.use_nodes = True  # ok for Blender 5; we'll modernize later
         nt = mat.node_tree
         if nt:
             bsdf = nt.nodes.get("Principled BSDF")
@@ -116,12 +114,8 @@ def build_piano_roll(
 
 
 def _simplify_note_stream(notes: list[NoteEvent]) -> list[NoteEvent]:
-    """
-    Build a time-ordered stream of "note-on targets".
-    For Step2 we sample one point per note start (sorted), using the note pitch at that time.
-    """
-    out = sorted(notes, key=lambda n: (n.start_s, n.pitch))
-    return out
+    # one point per note start (sorted)
+    return sorted(notes, key=lambda n: (n.start_s, n.pitch))
 
 
 def build_path_curve_from_notes(
@@ -134,14 +128,9 @@ def build_path_curve_from_notes(
     z: float = 0.02,
     curve_name: str = "MIDI_PATH",
 ) -> bpy.types.Object:
-    """
-    Create a Curve object whose points go through (time, pitch) note-on targets.
-    This is the backbone for the 'drop' to follow in Step3.
-    """
     col = _ensure_collection(collection_name)
     _clear_collection(col)
 
-    # Remove old curve datablock if exists
     old_obj = bpy.data.objects.get(curve_name)
     if old_obj:
         _remove_object(old_obj)
@@ -150,32 +139,28 @@ def build_path_curve_from_notes(
         bpy.data.curves.remove(old_curve)
 
     targets = _simplify_note_stream(notes)
-    if not targets:
-        # create an empty curve anyway
-        crv = bpy.data.curves.new(curve_name, type="CURVE")
-        crv.dimensions = "3D"
-        spl = crv.splines.new("POLY")
-        spl.points.add(1)
-        spl.points[0].co = (0.0, 0.0, z, 1.0)
-        spl.points[1].co = (1.0, 0.0, z, 1.0)
-        obj = bpy.data.objects.new(curve_name, crv)
-        col.objects.link(obj)
-        return obj
 
     crv = bpy.data.curves.new(curve_name, type="CURVE")
     crv.dimensions = "3D"
     crv.resolution_u = 24
-    crv.fill_mode = "NONE"
+
+    # IMPORTANT: Blender 5.0 does not accept fill_mode="NONE".
+    # For a path curve, we keep it purely a curve with no bevel/extrude.
+    crv.bevel_depth = 0.0
+    crv.extrude = 0.0
 
     spl = crv.splines.new("POLY")
-    spl.points.add(len(targets) - 1)
+    if not targets:
+        spl.points.add(1)
+        spl.points[0].co = (0.0, 0.0, z, 1.0)
+        spl.points[1].co = (1.0, 0.0, z, 1.0)
+    else:
+        spl.points.add(len(targets) - 1)
+        for i, n in enumerate(targets):
+            x = n.start_s * time_scale
+            y = (n.pitch - pitch_min) * pitch_scale
+            spl.points[i].co = (x, y, z, 1.0)
 
-    for i, n in enumerate(targets):
-        x = n.start_s * time_scale
-        y = (n.pitch - pitch_min) * pitch_scale
-        spl.points[i].co = (x, y, z, 1.0)
-
-    # nice smoothing by setting handle types if BEZIER (we stay POLY for deterministic)
     obj = bpy.data.objects.new(curve_name, crv)
     col.objects.link(obj)
 
@@ -198,19 +183,16 @@ def ensure_drop_rig(
         drop.empty_display_size = 0.12
         col.objects.link(drop)
 
-    # Follow Path constraint (no animation yet)
     c = drop.constraints.get("FOLLOW_PATH")
     if c is None:
         c = drop.constraints.new(type="FOLLOW_PATH")
         c.name = "FOLLOW_PATH"
-
     c.target = path_obj
-    c.use_fixed_location = True  # use offset_factor
+    c.use_fixed_location = True
     c.offset_factor = 0.0
     c.forward_axis = "FORWARD_Y"
     c.up_axis = "UP_Z"
 
-    # TrackTo so it faces travel direction later (optional)
     t = drop.constraints.get("TRACK_TO")
     if t is None:
         t = drop.constraints.new(type="TRACK_TO")
@@ -229,13 +211,12 @@ def main() -> int:
     ap.add_argument("--out", required=False)
     ap.add_argument("--time-scale", type=float, default=1.0)
     ap.add_argument("--pitch-scale", type=float, default=0.12)
-    ap.add_argument("--make-path", action="store_true", help="Also build MIDI_PATH curve + DROP rig")
+    ap.add_argument("--make-path", action="store_true")
     args = ap.parse_args(_argv_after_double_dash(sys.argv))
 
     notes = parse_midi_notes(args.midi)
     notes, pmin, pmax = normalize_notes(notes)
 
-    # Step1: bars
     build_piano_roll(
         notes,
         pitch_min=pmin,
@@ -243,7 +224,6 @@ def main() -> int:
         pitch_scale=args.pitch_scale,
     )
 
-    # Step2: curve + drop rig
     if args.make_path:
         path_obj = build_path_curve_from_notes(
             notes,
