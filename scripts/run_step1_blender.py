@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 # ------------------------------------------------------------------------------
 
 import argparse
+import math
 from pathlib import Path as _Path
 
 import bpy
@@ -51,12 +52,16 @@ def _get_or_create_material(name: str) -> bpy.types.Material:
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
-        mat.use_nodes = True  # ok for Blender 5; we'll modernize later
+        mat.use_nodes = True  # Blender 5 ok; deprecation only for 6.0+
         nt = mat.node_tree
         if nt:
             bsdf = nt.nodes.get("Principled BSDF")
-            if bsdf and "Emission Strength" in bsdf.inputs:
-                bsdf.inputs["Emission Strength"].default_value = 1.0
+            if bsdf:
+                # safe access
+                if "Emission Strength" in bsdf.inputs:
+                    bsdf.inputs["Emission Strength"].default_value = 0.0
+                if "Emission Color" in bsdf.inputs:
+                    bsdf.inputs["Emission Color"].default_value = (1.0, 1.0, 1.0, 1.0)
     return mat
 
 
@@ -143,9 +148,6 @@ def build_path_curve_from_notes(
     crv = bpy.data.curves.new(curve_name, type="CURVE")
     crv.dimensions = "3D"
     crv.resolution_u = 24
-
-    # IMPORTANT: Blender 5.0 does not accept fill_mode="NONE".
-    # For a path curve, we keep it purely a curve with no bevel/extrude.
     crv.bevel_depth = 0.0
     crv.extrude = 0.0
 
@@ -193,6 +195,7 @@ def ensure_drop_rig(
     c.forward_axis = "FORWARD_Y"
     c.up_axis = "UP_Z"
 
+    # optional look, doesn't harm
     t = drop.constraints.get("TRACK_TO")
     if t is None:
         t = drop.constraints.new(type="TRACK_TO")
@@ -205,13 +208,151 @@ def ensure_drop_rig(
     return drop
 
 
+def ensure_drop_light(
+    drop: bpy.types.Object,
+    *,
+    collection_name: str = "MIDI_DROP",
+    light_name: str = "DROP_LIGHT",
+) -> bpy.types.Object:
+    col = _ensure_collection(collection_name)
+
+    obj = bpy.data.objects.get(light_name)
+    if obj is None:
+        ld = bpy.data.lights.new(light_name, type="POINT")
+        obj = bpy.data.objects.new(light_name, ld)
+        col.objects.link(obj)
+        obj.parent = drop
+        obj.location = (0.0, 0.0, 0.0)
+
+    # baseline energy
+    if obj.data and hasattr(obj.data, "energy"):
+        obj.data.energy = 0.0
+    return obj
+
+
+def _sec_to_frame(sec: float, fps: int) -> int:
+    # frame 1 is time 0
+    return max(1, int(round(sec * fps)) + 1)
+
+
+def animate_drop_follow_path(
+    drop: bpy.types.Object,
+    notes: list[NoteEvent],
+    *,
+    fps: int,
+    total_duration_s: float,
+    start_frame: int = 1,
+) -> None:
+    c = drop.constraints.get("FOLLOW_PATH")
+    if c is None:
+        raise RuntimeError("DROP has no FOLLOW_PATH constraint")
+
+    end_frame = start_frame + int(round(total_duration_s * fps))
+    if end_frame <= start_frame:
+        end_frame = start_frame + 1
+
+    # linear traversal 0..1
+    c.offset_factor = 0.0
+    c.keyframe_insert(data_path="offset_factor", frame=start_frame)
+
+    c.offset_factor = 1.0
+    c.keyframe_insert(data_path="offset_factor", frame=end_frame)
+
+    # force linear interpolation on these keys
+    ad = drop.animation_data
+    if ad and ad.action:
+        for fc in ad.action.fcurves:
+            if fc.data_path.endswith("constraints[\"FOLLOW_PATH\"].offset_factor"):
+                for kp in fc.keyframe_points:
+                    kp.interpolation = "LINEAR"
+
+    print(f"[AudioV] Animated DROP follow path: frames {start_frame}->{end_frame}")
+
+
+def animate_bounce_and_flash(
+    drop: bpy.types.Object,
+    light_obj: bpy.types.Object,
+    notes: list[NoteEvent],
+    *,
+    fps: int,
+    bounce_amp: float = 0.25,
+    bounce_len_s: float = 0.10,   # duration of one bounce
+    light_peak: float = 1500.0,
+    light_len_s: float = 0.06,
+) -> None:
+    if not notes:
+        return
+
+    # ensure anim data exists
+    if drop.animation_data is None:
+        drop.animation_data_create()
+    if light_obj.animation_data is None:
+        light_obj.animation_data_create()
+
+    bounce_len_f = max(2, int(round(bounce_len_s * fps)))
+    light_len_f = max(2, int(round(light_len_s * fps)))
+
+    # We'll keyframe the drop empty local Z (works even with Follow Path constraint)
+    base_z = drop.location.z
+
+    for n in notes:
+        f0 = _sec_to_frame(n.start_s, fps)
+
+        # Bounce: f0 (base), f0+mid (up), f0+len (base)
+        f_mid = f0 + bounce_len_f // 2
+        f_end = f0 + bounce_len_f
+
+        drop.location.z = base_z
+        drop.keyframe_insert(data_path="location", index=2, frame=f0)
+
+        drop.location.z = base_z + bounce_amp
+        drop.keyframe_insert(data_path="location", index=2, frame=f_mid)
+
+        drop.location.z = base_z
+        drop.keyframe_insert(data_path="location", index=2, frame=f_end)
+
+        # Light flash energy: 0 -> peak -> 0
+        if light_obj.data and hasattr(light_obj.data, "energy"):
+            light_obj.data.energy = 0.0
+            light_obj.data.keyframe_insert(data_path="energy", frame=f0)
+
+            light_obj.data.energy = light_peak
+            light_obj.data.keyframe_insert(data_path="energy", frame=f0 + 1)
+
+            light_obj.data.energy = 0.0
+            light_obj.data.keyframe_insert(data_path="energy", frame=f0 + light_len_f)
+
+    # set bezier easing on bounce (nice pop)
+    ad = drop.animation_data
+    if ad and ad.action:
+        for fc in ad.action.fcurves:
+            if fc.data_path == "location" and fc.array_index == 2:
+                for kp in fc.keyframe_points:
+                    kp.interpolation = "BEZIER"
+
+    lad = light_obj.animation_data
+    if lad and lad.action:
+        for fc in lad.action.fcurves:
+            if fc.data_path == "energy":
+                for kp in fc.keyframe_points:
+                    kp.interpolation = "BEZIER"
+
+    print(f"[AudioV] Bounce+flash keys added: {len(notes)} hits")
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="audiov_step2")
+    ap = argparse.ArgumentParser(prog="audiov_step3")
     ap.add_argument("--midi", required=True)
     ap.add_argument("--out", required=False)
     ap.add_argument("--time-scale", type=float, default=1.0)
     ap.add_argument("--pitch-scale", type=float, default=0.12)
     ap.add_argument("--make-path", action="store_true")
+    ap.add_argument("--animate", action="store_true", help="Animate DROP on curve + bounce + flash")
+    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--bounce-amp", type=float, default=0.25)
+    ap.add_argument("--bounce-len", type=float, default=0.10)
+    ap.add_argument("--light-peak", type=float, default=1500.0)
+    ap.add_argument("--light-len", type=float, default=0.06)
     args = ap.parse_args(_argv_after_double_dash(sys.argv))
 
     notes = parse_midi_notes(args.midi)
@@ -224,14 +365,46 @@ def main() -> int:
         pitch_scale=args.pitch_scale,
     )
 
-    if args.make_path:
+    path_obj = None
+    drop = None
+
+    if args.make_path or args.animate:
         path_obj = build_path_curve_from_notes(
             notes,
             pitch_min=pmin,
             time_scale=args.time_scale,
             pitch_scale=args.pitch_scale,
         )
-        ensure_drop_rig(path_obj)
+        drop = ensure_drop_rig(path_obj)
+
+    if args.animate and drop:
+        # Set scene fps and frame range
+        scn = bpy.context.scene
+        scn.render.fps = args.fps
+
+        total_duration_s = 0.0
+        if notes:
+            total_duration_s = max(n.end_s for n in notes)
+        total_duration_s = max(total_duration_s, 0.1)
+
+        animate_drop_follow_path(drop, notes, fps=args.fps, total_duration_s=total_duration_s)
+
+        light_obj = ensure_drop_light(drop)
+        animate_bounce_and_flash(
+            drop,
+            light_obj,
+            notes,
+            fps=args.fps,
+            bounce_amp=args.bounce_amp,
+            bounce_len_s=args.bounce_len,
+            light_peak=args.light_peak,
+            light_len_s=args.light_len,
+        )
+
+        end_frame = _sec_to_frame(total_duration_s, args.fps) + 5
+        scn.frame_start = 1
+        scn.frame_end = end_frame
+        print(f"[AudioV] Scene frame range: 1..{end_frame}")
 
     if args.out:
         outp = _Path(args.out)
