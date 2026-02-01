@@ -52,15 +52,25 @@ def _get_or_create_material(name: str) -> bpy.types.Material:
     if mat is None:
         mat = bpy.data.materials.new(name)
         mat.use_nodes = True  # Blender 5 ok; deprecation only for 6.0+
-        nt = mat.node_tree
-        if nt:
-            bsdf = nt.nodes.get("Principled BSDF")
-            if bsdf:
-                if "Emission Strength" in bsdf.inputs:
-                    bsdf.inputs["Emission Strength"].default_value = 0.0
-                if "Emission Color" in bsdf.inputs:
-                    bsdf.inputs["Emission Color"].default_value = (1.0, 1.0, 1.0, 1.0)
     return mat
+
+
+def _ensure_principled(mat: bpy.types.Material) -> bpy.types.Node | None:
+    if not mat.use_nodes or not mat.node_tree:
+        return None
+    nt = mat.node_tree
+    bsdf = nt.nodes.get("Principled BSDF")
+    out = nt.nodes.get("Material Output")
+    if out is None:
+        out = nt.nodes.new("ShaderNodeOutputMaterial")
+        out.location = (300, 0)
+    if bsdf is None:
+        bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+    # ensure link
+    if not out.inputs["Surface"].is_linked:
+        nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return bsdf
 
 
 def build_piano_roll(
@@ -81,6 +91,12 @@ def build_piano_roll(
         return col
 
     mat = _get_or_create_material("MAT_MIDI_NOTE")
+    bsdf = _ensure_principled(mat)
+    if bsdf:
+        if "Emission Strength" in bsdf.inputs:
+            bsdf.inputs["Emission Strength"].default_value = 0.0
+        if "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = (0.8, 0.85, 0.95, 1.0)
 
     import bmesh
 
@@ -177,10 +193,27 @@ def ensure_drop_rig(
 
     drop = bpy.data.objects.get(drop_name)
     if drop is None:
-        drop = bpy.data.objects.new(drop_name, None)
-        drop.empty_display_type = "SPHERE"
-        drop.empty_display_size = 0.12
+        # make it a visible sphere mesh (better than empty)
+        me = bpy.data.meshes.new(drop_name + "_mesh")
+        drop = bpy.data.objects.new(drop_name, me)
         col.objects.link(drop)
+
+        import bmesh
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=16, radius=0.12)
+        bm.to_mesh(me)
+        bm.free()
+
+        mat = _get_or_create_material("MAT_DROP")
+        bsdf = _ensure_principled(mat)
+        if bsdf:
+            if "Emission Strength" in bsdf.inputs:
+                bsdf.inputs["Emission Strength"].default_value = 0.0
+            if "Emission Color" in bsdf.inputs:
+                bsdf.inputs["Emission Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+            if "Base Color" in bsdf.inputs:
+                bsdf.inputs["Base Color"].default_value = (0.1, 0.1, 0.1, 1.0)
+        drop.data.materials.append(mat)
 
     c = drop.constraints.get("FOLLOW_PATH")
     if c is None:
@@ -242,8 +275,6 @@ def animate_drop_follow_path(
     c.offset_factor = 1.0
     c.keyframe_insert(data_path="offset_factor", frame=end_frame)
 
-    # NOTE: Blender 5.0 "Layered Actions" -> no direct action.fcurves.
-    # We intentionally DO NOT force interpolation here (still works).
     print(f"[AudioV] Animated DROP follow path: frames {start_frame}->{end_frame}")
 
 
@@ -257,6 +288,7 @@ def animate_bounce_and_flash(
     bounce_len_s: float = 0.10,
     light_peak: float = 1500.0,
     light_len_s: float = 0.06,
+    drop_emit_peak: float = 20.0,
 ) -> None:
     if not notes:
         return
@@ -266,11 +298,22 @@ def animate_bounce_and_flash(
 
     base_z = drop.location.z
 
+    # drop material emission strength (if available)
+    drop_mat = None
+    if getattr(drop, "data", None) and getattr(drop.data, "materials", None):
+        if len(drop.data.materials) > 0:
+            drop_mat = drop.data.materials[0]
+
+    drop_bsdf = None
+    if drop_mat and drop_mat.use_nodes and drop_mat.node_tree:
+        drop_bsdf = drop_mat.node_tree.nodes.get("Principled BSDF")
+
     for n in notes:
         f0 = _sec_to_frame(n.start_s, fps)
         f_mid = f0 + bounce_len_f // 2
         f_end = f0 + bounce_len_f
 
+        # Bounce
         drop.location.z = base_z
         drop.keyframe_insert(data_path="location", index=2, frame=f0)
 
@@ -280,6 +323,7 @@ def animate_bounce_and_flash(
         drop.location.z = base_z
         drop.keyframe_insert(data_path="location", index=2, frame=f_end)
 
+        # Light flash
         if light_obj.data and hasattr(light_obj.data, "energy"):
             light_obj.data.energy = 0.0
             light_obj.data.keyframe_insert(data_path="energy", frame=f0)
@@ -290,11 +334,119 @@ def animate_bounce_and_flash(
             light_obj.data.energy = 0.0
             light_obj.data.keyframe_insert(data_path="energy", frame=f0 + light_len_f)
 
+        # Drop emission flash (visible even without lighting)
+        if drop_bsdf and "Emission Strength" in drop_bsdf.inputs:
+            drop_bsdf.inputs["Emission Strength"].default_value = 0.0
+            drop_bsdf.inputs["Emission Strength"].keyframe_insert("default_value", frame=f0)
+
+            drop_bsdf.inputs["Emission Strength"].default_value = drop_emit_peak
+            drop_bsdf.inputs["Emission Strength"].keyframe_insert("default_value", frame=f0 + 1)
+
+            drop_bsdf.inputs["Emission Strength"].default_value = 0.0
+            drop_bsdf.inputs["Emission Strength"].keyframe_insert("default_value", frame=f0 + light_len_f)
+
     print(f"[AudioV] Bounce+flash keys added: {len(notes)} hits")
 
 
+def ensure_scene_basics() -> None:
+    scn = bpy.context.scene
+
+    # World dark
+    if scn.world is None:
+        scn.world = bpy.data.worlds.new("WORLD_AudioV")
+    scn.world.use_nodes = True
+    nt = scn.world.node_tree
+    if nt:
+        bg = nt.nodes.get("Background")
+        if bg and "Color" in bg.inputs:
+            bg.inputs["Color"].default_value = (0.01, 0.01, 0.015, 1.0)
+        if bg and "Strength" in bg.inputs:
+            bg.inputs["Strength"].default_value = 1.0
+
+    # Color management
+    view = scn.view_settings
+    view.view_transform = "Filmic"
+    view.look = "None"
+    view.exposure = 0.0
+    view.gamma = 1.0
+
+
+def ensure_floor(*, z: float = 0.0, size: float = 50.0) -> bpy.types.Object:
+    col = _ensure_collection("SCENE")
+    obj = bpy.data.objects.get("FLOOR")
+    if obj is None:
+        me = bpy.data.meshes.new("FLOOR_mesh")
+        obj = bpy.data.objects.new("FLOOR", me)
+        col.objects.link(obj)
+
+        import bmesh
+        bm = bmesh.new()
+        bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=size)
+        bm.to_mesh(me)
+        bm.free()
+
+        mat = _get_or_create_material("MAT_FLOOR")
+        bsdf = _ensure_principled(mat)
+        if bsdf and "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = (0.03, 0.03, 0.04, 1.0)
+        obj.data.materials.append(mat)
+
+    obj.location = (0.0, 0.0, z)
+    return obj
+
+
+def ensure_camera_to_bounds(bounds_min, bounds_max) -> bpy.types.Object:
+    col = _ensure_collection("SCENE")
+    cam = bpy.data.objects.get("CAM_AudioV")
+    if cam is None:
+        cd = bpy.data.cameras.new("CAM_AudioV")
+        cam = bpy.data.objects.new("CAM_AudioV", cd)
+        col.objects.link(cam)
+        bpy.context.scene.camera = cam
+
+    # simple framing: look from -Y, slightly above, towards center
+    cx = (bounds_min[0] + bounds_max[0]) * 0.5
+    cy = (bounds_min[1] + bounds_max[1]) * 0.5
+    cz = (bounds_min[2] + bounds_max[2]) * 0.5
+
+    size_x = max(1e-6, bounds_max[0] - bounds_min[0])
+    size_y = max(1e-6, bounds_max[1] - bounds_min[1])
+    size_z = max(1e-6, bounds_max[2] - bounds_min[2])
+    diag = (size_x * size_x + size_y * size_y + size_z * size_z) ** 0.5
+
+    cam.location = (cx, cy - diag * 1.6, cz + diag * 0.7)
+    cam.rotation_euler = (1.15, 0.0, 0.0)  # tilt down
+
+    return cam
+
+
+def _collection_bounds(col: bpy.types.Collection):
+    import math
+    bmin = [math.inf, math.inf, math.inf]
+    bmax = [-math.inf, -math.inf, -math.inf]
+    any_obj = False
+
+    for o in col.objects:
+        if o.type not in {"MESH", "CURVE"}:
+            continue
+        any_obj = True
+        for v in o.bound_box:
+            # v is local; convert to world
+            w = o.matrix_world @ bpy.mathutils.Vector(v)
+            bmin[0] = min(bmin[0], w.x)
+            bmin[1] = min(bmin[1], w.y)
+            bmin[2] = min(bmin[2], w.z)
+            bmax[0] = max(bmax[0], w.x)
+            bmax[1] = max(bmax[1], w.y)
+            bmax[2] = max(bmax[2], w.z)
+
+    if not any_obj:
+        return (0.0, 0.0, 0.0), (5.0, 5.0, 5.0)
+    return tuple(bmin), tuple(bmax)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="audiov_step3")
+    ap = argparse.ArgumentParser(prog="audiov_step3_5_visu")
     ap.add_argument("--midi", required=True)
     ap.add_argument("--out", required=False)
     ap.add_argument("--time-scale", type=float, default=1.0)
@@ -306,12 +458,14 @@ def main() -> int:
     ap.add_argument("--bounce-len", type=float, default=0.10)
     ap.add_argument("--light-peak", type=float, default=1500.0)
     ap.add_argument("--light-len", type=float, default=0.06)
+    ap.add_argument("--drop-emit", type=float, default=25.0)
+    ap.add_argument("--visu", action="store_true", help="Add world+floor+camera for nice preview")
     args = ap.parse_args(_argv_after_double_dash(sys.argv))
 
     notes = parse_midi_notes(args.midi)
     notes, pmin, _pmax = normalize_notes(notes)
 
-    build_piano_roll(
+    sheet_col = build_piano_roll(
         notes,
         pitch_min=pmin,
         time_scale=args.time_scale,
@@ -335,7 +489,6 @@ def main() -> int:
         scn.render.fps = args.fps
 
         total_duration_s = max((max(n.end_s for n in notes) if notes else 0.0), 0.1)
-
         animate_drop_follow_path(drop, fps=args.fps, total_duration_s=total_duration_s)
 
         light_obj = ensure_drop_light(drop)
@@ -348,12 +501,20 @@ def main() -> int:
             bounce_len_s=args.bounce_len,
             light_peak=args.light_peak,
             light_len_s=args.light_len,
+            drop_emit_peak=args.drop_emit,
         )
 
         end_frame = _sec_to_frame(total_duration_s, args.fps) + 5
         scn.frame_start = 1
         scn.frame_end = end_frame
         print(f"[AudioV] Scene frame range: 1..{end_frame}")
+
+    if args.visu:
+        ensure_scene_basics()
+        ensure_floor(z=0.0, size=100.0)
+        bmin, bmax = _collection_bounds(sheet_col)
+        ensure_camera_to_bounds(bmin, bmax)
+        print("[AudioV] VISU enabled: world+floor+camera")
 
     if args.out:
         outp = _Path(args.out)
