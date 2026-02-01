@@ -24,16 +24,6 @@ def _detect_engine() -> str:
     return next(iter(items))
 
 
-def _has_ffmpeg_format_runtime() -> bool:
-    # IMPORTANT: must query the runtime enum on the actual ImageFormatSettings instance
-    scn = bpy.context.scene
-    prop = scn.render.image_settings.bl_rna.properties.get("file_format")
-    if not prop:
-        return False
-    ids = {it.identifier for it in prop.enum_items}
-    return "FFMPEG" in ids
-
-
 def _find_ffmpeg() -> str | None:
     import shutil
     return shutil.which("ffmpeg")
@@ -45,20 +35,6 @@ def _apply_common_settings(*, engine: str) -> None:
     scn.render.resolution_x = 1920
     scn.render.resolution_y = 1080
     scn.render.resolution_percentage = 100
-
-
-def _apply_video_settings(mp4_path: Path) -> None:
-    scn = bpy.context.scene
-    scn.render.image_settings.file_format = "FFMPEG"
-    scn.render.filepath = str(mp4_path)
-
-    ff = scn.render.ffmpeg
-    ff.format = "MPEG4"
-    ff.codec = "H264"
-    ff.constant_rate_factor = "MEDIUM"
-    ff.ffmpeg_preset = "GOOD"
-    ff.gopsize = 12
-    ff.use_max_b_frames = True
 
 
 def _apply_png_sequence_settings(seq_dir: Path) -> None:
@@ -76,6 +52,7 @@ def _apply_png_sequence_settings(seq_dir: Path) -> None:
 
 
 def _encode_mp4_from_png_seq(ffmpeg: str, seq_dir: Path, mp4_path: Path, fps: int) -> None:
+    # Blender writes frame_0001.png -> ffmpeg expects %04d with start_number=1
     inp = str(seq_dir / "frame_%04d.png")
     mp4_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -84,6 +61,8 @@ def _encode_mp4_from_png_seq(ffmpeg: str, seq_dir: Path, mp4_path: Path, fps: in
         "-y",
         "-framerate",
         str(int(fps)),
+        "-start_number",
+        "1",
         "-i",
         inp,
         "-c:v",
@@ -106,12 +85,12 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(prog="audiov_step4_render")
     ap.add_argument("--in", dest="inp", required=True, help="Input .blend")
-    ap.add_argument("--out", dest="outp", required=True, help="Output .mp4 (PNG fallback)")
+    ap.add_argument("--out", dest="outp", required=True, help="Output .mp4 (PNG+ffmpeg) or output dir for PNGs")
     ap.add_argument("--engine", default="AUTO", help="AUTO | BLENDER_EEVEE_NEXT | BLENDER_EEVEE | CYCLES")
     ap.add_argument("--fps", type=int, default=None)
     ap.add_argument("--frame-start", type=int, default=None)
     ap.add_argument("--frame-end", type=int, default=None)
-    ap.add_argument("--no-encode", action="store_true")
+    ap.add_argument("--no-encode", action="store_true", help="When --out is .mp4, do not run ffmpeg encode")
     args = ap.parse_args(_argv_after_double_dash(sys.argv))
 
     inp = Path(args.inp)
@@ -133,20 +112,20 @@ def main() -> int:
     print(f"[AudioV] Render engine: {engine}")
     print(f"[AudioV] Frames: {scn.frame_start}..{scn.frame_end} @ {scn.render.fps} fps")
 
-    # MP4 direct only if runtime enum supports it
-    if outp.suffix.lower() == ".mp4" and _has_ffmpeg_format_runtime():
-        _apply_video_settings(outp)
-        print(f"[AudioV] Video output (direct): {outp}")
-        bpy.ops.render.render(animation=True)
-        print("[AudioV] Render done (mp4).")
-        return 0
+    # Always render PNG sequence (Blender build may not support FFMPEG output)
+    if outp.suffix.lower() == ".mp4":
+        seq_dir = outp.parent / (outp.stem + "_png")
+    else:
+        # treat as directory for image sequence
+        seq_dir = outp
 
-    # Fallback: PNG sequence
-    seq_dir = outp.parent / (outp.stem + "_png")
     _apply_png_sequence_settings(seq_dir)
-    print(f"[AudioV] Direct MP4 not available -> rendering PNG sequence in: {seq_dir}")
+    print(f"[AudioV] Rendering PNG sequence in: {seq_dir}")
     bpy.ops.render.render(animation=True)
     print("[AudioV] Render done (png sequence).")
+
+    if outp.suffix.lower() != ".mp4":
+        return 0
 
     if args.no_encode:
         print("[AudioV] Encoding skipped (--no-encode).")
@@ -155,8 +134,9 @@ def main() -> int:
     ff = _find_ffmpeg()
     if ff is None:
         print("[AudioV] ffmpeg.exe not found on PATH.")
-        print("[AudioV] To encode manually, run:")
-        print(f'ffmpeg -y -framerate {scn.render.fps} -i "{seq_dir / "frame_%04d.png"}" -c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium "{outp}"')
+        print("[AudioV] Restart PowerShell (PATH updated by winget), then rerun Step4.")
+        print("[AudioV] Or encode manually:")
+        print(f'ffmpeg -y -framerate {scn.render.fps} -start_number 1 -i "{seq_dir / "frame_%04d.png"}" -c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium "{outp}"')
         return 0
 
     _encode_mp4_from_png_seq(ff, seq_dir, outp, fps=scn.render.fps)
