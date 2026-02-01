@@ -24,13 +24,17 @@ def _detect_engine() -> str:
     return next(iter(items))
 
 
-def _has_ffmpeg_format() -> bool:
-    items = {it.identifier for it in bpy.types.ImageFormatSettings.bl_rna.properties["file_format"].enum_items}
-    return "FFMPEG" in items
+def _has_ffmpeg_format_runtime() -> bool:
+    # IMPORTANT: must query the runtime enum on the actual ImageFormatSettings instance
+    scn = bpy.context.scene
+    prop = scn.render.image_settings.bl_rna.properties.get("file_format")
+    if not prop:
+        return False
+    ids = {it.identifier for it in prop.enum_items}
+    return "FFMPEG" in ids
 
 
 def _find_ffmpeg() -> str | None:
-    # Best effort: try PATH
     import shutil
     return shutil.which("ffmpeg")
 
@@ -38,7 +42,6 @@ def _find_ffmpeg() -> str | None:
 def _apply_common_settings(*, engine: str) -> None:
     scn = bpy.context.scene
     scn.render.engine = engine
-
     scn.render.resolution_x = 1920
     scn.render.resolution_y = 1080
     scn.render.resolution_percentage = 100
@@ -46,8 +49,6 @@ def _apply_common_settings(*, engine: str) -> None:
 
 def _apply_video_settings(mp4_path: Path) -> None:
     scn = bpy.context.scene
-
-    # This only works if "FFMPEG" exists in enum.
     scn.render.image_settings.file_format = "FFMPEG"
     scn.render.filepath = str(mp4_path)
 
@@ -58,19 +59,16 @@ def _apply_video_settings(mp4_path: Path) -> None:
     ff.ffmpeg_preset = "GOOD"
     ff.gopsize = 12
     ff.use_max_b_frames = True
-    # audio later:
-    # ff.audio_codec = "AAC"
 
 
 def _apply_png_sequence_settings(seq_dir: Path) -> None:
     scn = bpy.context.scene
-
     seq_dir.mkdir(parents=True, exist_ok=True)
-    # Blender uses render.filepath as prefix; ending with separator ensures directory-style output.
-    prefix = str(seq_dir / "frame_")
-    scn.render.filepath = prefix
 
+    # Blender writes frame_0001.png when filepath is a prefix
+    scn.render.filepath = str(seq_dir / "frame_")
     scn.render.image_settings.file_format = "PNG"
+
     if hasattr(scn.render.image_settings, "color_mode"):
         scn.render.image_settings.color_mode = "RGBA"
     if hasattr(scn.render.image_settings, "compression"):
@@ -78,7 +76,6 @@ def _apply_png_sequence_settings(seq_dir: Path) -> None:
 
 
 def _encode_mp4_from_png_seq(ffmpeg: str, seq_dir: Path, mp4_path: Path, fps: int) -> None:
-    # frame_0001.png (Blender default for filepath prefix "frame_")
     inp = str(seq_dir / "frame_%04d.png")
     mp4_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -109,12 +106,12 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(prog="audiov_step4_render")
     ap.add_argument("--in", dest="inp", required=True, help="Input .blend")
-    ap.add_argument("--out", dest="outp", required=True, help="Output .mp4 (or .png dir fallback)")
+    ap.add_argument("--out", dest="outp", required=True, help="Output .mp4 (PNG fallback)")
     ap.add_argument("--engine", default="AUTO", help="AUTO | BLENDER_EEVEE_NEXT | BLENDER_EEVEE | CYCLES")
-    ap.add_argument("--fps", type=int, default=None, help="Override fps (optional)")
+    ap.add_argument("--fps", type=int, default=None)
     ap.add_argument("--frame-start", type=int, default=None)
     ap.add_argument("--frame-end", type=int, default=None)
-    ap.add_argument("--no-encode", action="store_true", help="If PNG fallback, do not encode mp4 even if ffmpeg exists")
+    ap.add_argument("--no-encode", action="store_true")
     args = ap.parse_args(_argv_after_double_dash(sys.argv))
 
     inp = Path(args.inp)
@@ -136,17 +133,18 @@ def main() -> int:
     print(f"[AudioV] Render engine: {engine}")
     print(f"[AudioV] Frames: {scn.frame_start}..{scn.frame_end} @ {scn.render.fps} fps")
 
-    if _has_ffmpeg_format() and outp.suffix.lower() == ".mp4":
+    # MP4 direct only if runtime enum supports it
+    if outp.suffix.lower() == ".mp4" and _has_ffmpeg_format_runtime():
         _apply_video_settings(outp)
-        print(f"[AudioV] Video output: {outp}")
+        print(f"[AudioV] Video output (direct): {outp}")
         bpy.ops.render.render(animation=True)
         print("[AudioV] Render done (mp4).")
         return 0
 
     # Fallback: PNG sequence
-    seq_dir = outp if outp.suffix == "" else outp.parent / (outp.stem + "_png")
+    seq_dir = outp.parent / (outp.stem + "_png")
     _apply_png_sequence_settings(seq_dir)
-    print(f"[AudioV] FFmpeg format not available -> rendering PNG sequence in: {seq_dir}")
+    print(f"[AudioV] Direct MP4 not available -> rendering PNG sequence in: {seq_dir}")
     bpy.ops.render.render(animation=True)
     print("[AudioV] Render done (png sequence).")
 
@@ -158,12 +156,11 @@ def main() -> int:
     if ff is None:
         print("[AudioV] ffmpeg.exe not found on PATH.")
         print("[AudioV] To encode manually, run:")
-        print(f'ffmpeg -y -framerate {scn.render.fps} -i "{seq_dir / "frame_%04d.png"}" -c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium "{outp.with_suffix(".mp4")}"')
+        print(f'ffmpeg -y -framerate {scn.render.fps} -i "{seq_dir / "frame_%04d.png"}" -c:v libx264 -pix_fmt yuv420p -crf 18 -preset medium "{outp}"')
         return 0
 
-    mp4 = outp if outp.suffix.lower() == ".mp4" else (outp / "output.mp4")
-    _encode_mp4_from_png_seq(ff, seq_dir, mp4, fps=scn.render.fps)
-    print(f"[AudioV] Encoded: {mp4}")
+    _encode_mp4_from_png_seq(ff, seq_dir, outp, fps=scn.render.fps)
+    print(f"[AudioV] Encoded: {outp}")
     return 0
 
 
