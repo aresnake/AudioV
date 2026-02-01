@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-import argparse
+# --- bootstrap sys.path so "src/" is importable even in Blender --python mode ---
+import sys
 from pathlib import Path
+
+THIS = Path(__file__).resolve()
+ROOT = THIS.parents[1]          # D:\AudioV
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+# ------------------------------------------------------------------------------
+
+import argparse
+from pathlib import Path as _Path
 
 import bpy
 
-import scripts._bootstrap_sys_path  # noqa: F401
 from audiov.midi_sheet import parse_midi_notes, normalize_notes
 
 
@@ -95,7 +105,7 @@ def main() -> int:
     build_piano_roll(args.midi, time_scale=args.time_scale, pitch_scale=args.pitch_scale)
 
     if args.out:
-        outp = Path(args.out)
+        outp = _Path(args.out)
         outp.parent.mkdir(parents=True, exist_ok=True)
         bpy.ops.wm.save_as_mainfile(filepath=str(outp))
         print(f"[AudioV] Saved: {outp}")
