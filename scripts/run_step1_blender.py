@@ -19,6 +19,13 @@ import bpy
 from audiov.midi_sheet import parse_midi_notes, normalize_notes
 
 
+def _argv_after_double_dash(argv: list[str]) -> list[str]:
+    # Blender passes its own args. Convention: user args are after "--"
+    if "--" in argv:
+        return argv[argv.index("--") + 1 :]
+    return []
+
+
 def _ensure_collection(name: str) -> bpy.types.Collection:
     col = bpy.data.collections.get(name)
     if col is None:
@@ -95,12 +102,14 @@ def build_piano_roll(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(prog="audiov_step1")
     ap.add_argument("--midi", required=True)
     ap.add_argument("--out", required=False)
     ap.add_argument("--time-scale", type=float, default=1.0)
     ap.add_argument("--pitch-scale", type=float, default=0.1)
-    args, _ = ap.parse_known_args()
+
+    user_argv = _argv_after_double_dash(sys.argv)
+    args = ap.parse_args(user_argv)
 
     build_piano_roll(args.midi, time_scale=args.time_scale, pitch_scale=args.pitch_scale)
 
