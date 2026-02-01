@@ -12,7 +12,6 @@ if str(SRC) not in sys.path:
 # ------------------------------------------------------------------------------
 
 import argparse
-import math
 from pathlib import Path as _Path
 
 import bpy
@@ -57,7 +56,6 @@ def _get_or_create_material(name: str) -> bpy.types.Material:
         if nt:
             bsdf = nt.nodes.get("Principled BSDF")
             if bsdf:
-                # safe access
                 if "Emission Strength" in bsdf.inputs:
                     bsdf.inputs["Emission Strength"].default_value = 0.0
                 if "Emission Color" in bsdf.inputs:
@@ -119,7 +117,6 @@ def build_piano_roll(
 
 
 def _simplify_note_stream(notes: list[NoteEvent]) -> list[NoteEvent]:
-    # one point per note start (sorted)
     return sorted(notes, key=lambda n: (n.start_s, n.pitch))
 
 
@@ -195,15 +192,6 @@ def ensure_drop_rig(
     c.forward_axis = "FORWARD_Y"
     c.up_axis = "UP_Z"
 
-    # optional look, doesn't harm
-    t = drop.constraints.get("TRACK_TO")
-    if t is None:
-        t = drop.constraints.new(type="TRACK_TO")
-        t.name = "TRACK_TO"
-    t.target = path_obj
-    t.track_axis = "TRACK_NEGATIVE_Z"
-    t.up_axis = "UP_Y"
-
     print("[AudioV] DROP rig ready (constraints set).")
     return drop
 
@@ -224,20 +212,17 @@ def ensure_drop_light(
         obj.parent = drop
         obj.location = (0.0, 0.0, 0.0)
 
-    # baseline energy
     if obj.data and hasattr(obj.data, "energy"):
         obj.data.energy = 0.0
     return obj
 
 
 def _sec_to_frame(sec: float, fps: int) -> int:
-    # frame 1 is time 0
     return max(1, int(round(sec * fps)) + 1)
 
 
 def animate_drop_follow_path(
     drop: bpy.types.Object,
-    notes: list[NoteEvent],
     *,
     fps: int,
     total_duration_s: float,
@@ -251,21 +236,14 @@ def animate_drop_follow_path(
     if end_frame <= start_frame:
         end_frame = start_frame + 1
 
-    # linear traversal 0..1
     c.offset_factor = 0.0
     c.keyframe_insert(data_path="offset_factor", frame=start_frame)
 
     c.offset_factor = 1.0
     c.keyframe_insert(data_path="offset_factor", frame=end_frame)
 
-    # force linear interpolation on these keys
-    ad = drop.animation_data
-    if ad and ad.action:
-        for fc in ad.action.fcurves:
-            if fc.data_path.endswith("constraints[\"FOLLOW_PATH\"].offset_factor"):
-                for kp in fc.keyframe_points:
-                    kp.interpolation = "LINEAR"
-
+    # NOTE: Blender 5.0 "Layered Actions" -> no direct action.fcurves.
+    # We intentionally DO NOT force interpolation here (still works).
     print(f"[AudioV] Animated DROP follow path: frames {start_frame}->{end_frame}")
 
 
@@ -276,29 +254,20 @@ def animate_bounce_and_flash(
     *,
     fps: int,
     bounce_amp: float = 0.25,
-    bounce_len_s: float = 0.10,   # duration of one bounce
+    bounce_len_s: float = 0.10,
     light_peak: float = 1500.0,
     light_len_s: float = 0.06,
 ) -> None:
     if not notes:
         return
 
-    # ensure anim data exists
-    if drop.animation_data is None:
-        drop.animation_data_create()
-    if light_obj.animation_data is None:
-        light_obj.animation_data_create()
-
     bounce_len_f = max(2, int(round(bounce_len_s * fps)))
     light_len_f = max(2, int(round(light_len_s * fps)))
 
-    # We'll keyframe the drop empty local Z (works even with Follow Path constraint)
     base_z = drop.location.z
 
     for n in notes:
         f0 = _sec_to_frame(n.start_s, fps)
-
-        # Bounce: f0 (base), f0+mid (up), f0+len (base)
         f_mid = f0 + bounce_len_f // 2
         f_end = f0 + bounce_len_f
 
@@ -311,7 +280,6 @@ def animate_bounce_and_flash(
         drop.location.z = base_z
         drop.keyframe_insert(data_path="location", index=2, frame=f_end)
 
-        # Light flash energy: 0 -> peak -> 0
         if light_obj.data and hasattr(light_obj.data, "energy"):
             light_obj.data.energy = 0.0
             light_obj.data.keyframe_insert(data_path="energy", frame=f0)
@@ -321,21 +289,6 @@ def animate_bounce_and_flash(
 
             light_obj.data.energy = 0.0
             light_obj.data.keyframe_insert(data_path="energy", frame=f0 + light_len_f)
-
-    # set bezier easing on bounce (nice pop)
-    ad = drop.animation_data
-    if ad and ad.action:
-        for fc in ad.action.fcurves:
-            if fc.data_path == "location" and fc.array_index == 2:
-                for kp in fc.keyframe_points:
-                    kp.interpolation = "BEZIER"
-
-    lad = light_obj.animation_data
-    if lad and lad.action:
-        for fc in lad.action.fcurves:
-            if fc.data_path == "energy":
-                for kp in fc.keyframe_points:
-                    kp.interpolation = "BEZIER"
 
     print(f"[AudioV] Bounce+flash keys added: {len(notes)} hits")
 
@@ -347,7 +300,7 @@ def main() -> int:
     ap.add_argument("--time-scale", type=float, default=1.0)
     ap.add_argument("--pitch-scale", type=float, default=0.12)
     ap.add_argument("--make-path", action="store_true")
-    ap.add_argument("--animate", action="store_true", help="Animate DROP on curve + bounce + flash")
+    ap.add_argument("--animate", action="store_true")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--bounce-amp", type=float, default=0.25)
     ap.add_argument("--bounce-len", type=float, default=0.10)
@@ -356,7 +309,7 @@ def main() -> int:
     args = ap.parse_args(_argv_after_double_dash(sys.argv))
 
     notes = parse_midi_notes(args.midi)
-    notes, pmin, pmax = normalize_notes(notes)
+    notes, pmin, _pmax = normalize_notes(notes)
 
     build_piano_roll(
         notes,
@@ -378,16 +331,12 @@ def main() -> int:
         drop = ensure_drop_rig(path_obj)
 
     if args.animate and drop:
-        # Set scene fps and frame range
         scn = bpy.context.scene
         scn.render.fps = args.fps
 
-        total_duration_s = 0.0
-        if notes:
-            total_duration_s = max(n.end_s for n in notes)
-        total_duration_s = max(total_duration_s, 0.1)
+        total_duration_s = max((max(n.end_s for n in notes) if notes else 0.0), 0.1)
 
-        animate_drop_follow_path(drop, notes, fps=args.fps, total_duration_s=total_duration_s)
+        animate_drop_follow_path(drop, fps=args.fps, total_duration_s=total_duration_s)
 
         light_obj = ensure_drop_light(drop)
         animate_bounce_and_flash(
